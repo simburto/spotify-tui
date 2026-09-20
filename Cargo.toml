@@ -1,0 +1,51 @@
+[package]
+name = "spotify-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Windows API bindings
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_JobObjects",
+] }
+
+# Desktop GUI (egui/eframe)
+egui = "0.29.1"
+eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow"] }
+
+# Audio Pipeline
+rubato = "0.15"
+rtrb = "0.3"
+
+# Async & Networking
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+open = "5.3"
+
+# Spotify Web API with PKCE OAuth
+rspotify = { version = "0.13", features = ["cli", "client-reqwest", "reqwest-rustls-tls"] }
+
+# Windows SMTC (Hardware Media Keys & Flyout)
+souvlaki = "0.7"
+
+# Utilities
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+reqwest = "0.12.28"
+egui_extras = { version = "0.29.1", features = ["image", "all_loaders"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+figlet-rs = "0.1.5"
+urlencoding = "2.1.3"

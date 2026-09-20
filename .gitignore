@@ -1,0 +1,28 @@
+# --- Build Artifacts & Packaging ---
+/target/
+/dist/
+*.exe
+*.dll
+*.pdb
+
+# --- Secrets & Auth Credentials ---
+soloist_config.json
+.spotify_token_cache.json
+
+# --- QEMU Runtime Binaries & ROMs ---
+/qemu/
+
+# --- Heavy Guest VM Images & Kernel Artifacts ---
+assets/guest/rootfs.ext4
+assets/guest/*.img
+assets/guest/*.qcow2
+assets/guest/vmlinuz
+assets/guest/initrd.img
+*.tar.gz
+
+# --- IDE & Environment Specific ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
