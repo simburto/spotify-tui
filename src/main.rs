@@ -75,7 +75,7 @@ struct AppConfig {
 
 impl AppConfig {
     fn path() -> PathBuf {
-        PathBuf::from("soloist_config.json")
+        PathBuf::from("config.json")
     }
 
     fn load() -> Self {
@@ -3904,7 +3904,7 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                                        log::warn!("Soloist WebSocket connection closed or errored");
+                                        log::warn!("Soloist WebSocket connection closed or errored; reconnecting in 2s...");
                                         ws_conn_flag.store(false, Ordering::Relaxed);
                                         break;
                                     }

@@ -6,7 +6,7 @@
 *.pdb
 
 # --- Secrets & Auth Credentials ---
-soloist_config.json
+config.json
 .spotify_token_cache.json
 
 # --- QEMU Runtime Binaries & ROMs ---

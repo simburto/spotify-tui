@@ -36,7 +36,7 @@ impl Default for QemuConfig {
             kernel_path: PathBuf::from("assets/guest/vmlinuz"),
             initrd_path: PathBuf::from("assets/guest/initrd.img"),
             disk_image: PathBuf::from("assets/guest/rootfs.ext4"),
-            memory_mb: 128,
+            memory_mb: 256,
             smp_cores: 1,
         }
     }
