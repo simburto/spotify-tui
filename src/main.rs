@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 
 mod qemu;
 mod spotify;
@@ -121,6 +121,7 @@ enum SoloistCommand {
 #[derive(Debug, Clone)]
 enum SpotifyRequest {
     Init(String),
+    Reauthenticate,
     RefreshLibrary,
     Search(String),
     FetchLikedSongs,
@@ -1365,7 +1366,15 @@ impl eframe::App for SoloistApp {
                         ui.add_space(6.0);
 
                         let name = st.user_name.as_deref().unwrap_or("Spotify");
-                        ui.label(RichText::new(name).font(FontId::monospace(11.5)).color(COLOR_TEXT_BRIGHT));
+                        let prof_resp = ui.add(
+                            egui::Button::new(
+                                RichText::new(name)
+                                    .font(FontId::monospace(11.5))
+                                    .color(COLOR_TEXT_BRIGHT),
+                            )
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false),
+                        );
 
                         ui.add_space(4.0);
 
@@ -1386,6 +1395,11 @@ impl eframe::App for SoloistApp {
                                 FontId::monospace(10.0),
                                 COLOR_TEXT_DIM,
                             );
+                        }
+
+                        // Clicking on the profile name or placeholder allows re-logging in
+                        if prof_resp.on_hover_text("Click to log in or switch Spotify account").clicked() {
+                            let _ = self.spotify_req_tx.blocking_send(SpotifyRequest::Reauthenticate);
                         }
                     });
                 });
@@ -3976,6 +3990,76 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                SpotifyRequest::Reauthenticate => {
+                    let reauth_result = if let Some(ref mut mgr) = spotify_mgr {
+                        mgr.reauthorize().await
+                    } else {
+                        let stored_id = config.client_id.trim().to_string();
+                        if !stored_id.is_empty() {
+                            match SpotifyManager::init(&stored_id).await {
+                                Ok(m) => {
+                                    spotify_mgr = Some(m);
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Err(anyhow::anyhow!("No client_id found in config"))
+                        }
+                    };
+
+                    match reauth_result {
+                        Ok(()) => {
+                            log::info!("Browser re-authorization succeeded. Hydrating user state and library...");
+                            if let Some(ref mgr) = spotify_mgr {
+                                // 1. User Profile info
+                                if let Ok(user_info) = mgr.get_current_user().await {
+                                    if let Ok(mut st) = state_spotify.write() {
+                                        st.user_name = Some(user_info.0);
+                                        st.user_avatar_url = user_info.1;
+                                        st.current_user_id = Some(user_info.2);
+                                        st.show_key_prompt = false;
+                                        st.key_prompt_error = None;
+                                    }
+                                }
+                                // 2. Liked Songs
+                                if let Ok(liked) = mgr.get_liked_songs().await {
+                                    if let Ok(mut st) = state_spotify.write() {
+                                        st.liked_track_uris = liked.iter().map(|t| t.uri.clone()).collect();
+                                        if st.active_nav == "Liked Songs" {
+                                            st.displayed_tracks = liked;
+                                            st.is_loading_view = false;
+                                        }
+                                    }
+                                }
+                                // 3. Playlists
+                                if let Ok(pls) = mgr.get_user_playlists().await {
+                                    if let Ok(mut st) = state_spotify.write() {
+                                        st.user_playlists = pls;
+                                    }
+                                }
+                                // 4. Albums & Artists
+                                if let Ok(albums) = mgr.get_saved_albums().await {
+                                    if let Ok(mut st) = state_spotify.write() {
+                                        st.user_saved_albums = albums;
+                                    }
+                                }
+                                if let Ok(artists) = mgr.get_followed_artists().await {
+                                    if let Ok(mut st) = state_spotify.write() {
+                                        st.user_followed_artists = artists;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Browser re-authorization failed: {:?}", e);
+                            if let Ok(mut st) = state_spotify.write() {
+                                st.key_prompt_error = Some(format!("OAuth failed: {:?}", e));
+                                st.show_key_prompt = true;
+                            }
+                        }
+                    }
+                }
                 SpotifyRequest::Search(query) => {
                     if let Some(ref mgr) = spotify_mgr {
                         match mgr.search_tracks(&query).await {
@@ -4000,7 +4084,6 @@ fn main() -> Result<()> {
                                 if let Ok(mut st) = state_spotify.write() {
                                     st.artist_page = None;
                                     st.search_results.clear();
-                                    // Populate fast lookup set
                                     st.liked_track_uris = tracks.iter().map(|t| t.uri.clone()).collect();
                                     st.displayed_tracks = tracks;
                                     st.active_context_uri = None;
@@ -4010,12 +4093,8 @@ fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 log::error!("Failed to fetch liked songs: {:?}", e);
-                                // If the token is invalid/revoked, prompt re-authentication
-                                if e.to_string().contains("InvalidToken") {
-                                    if let Ok(mut st) = state_spotify.write() {
-                                        st.key_prompt_error = Some("Spotify session expired. Please re-authenticate.".into());
-                                        st.show_key_prompt = true;
-                                    }
+                                if let Ok(mut st) = state_spotify.write() {
+                                    st.is_loading_view = false;
                                 }
                             }
                         }
@@ -4252,6 +4331,13 @@ fn main() -> Result<()> {
                 }
                 SpotifyRequest::RefreshLibrary => {
                     if let Some(ref mgr) = spotify_mgr {
+                        if let Err(e) = mgr.ensure_token().await {
+                            if e.to_string().contains("SESSION_EXPIRED") {
+                                log::warn!("Session expired during library refresh. Triggering browser OAuth re-login...");
+                                let _ = req_tx_clone.send(SpotifyRequest::Reauthenticate).await;
+                            }
+                            continue;
+                        }
                         // 1. Refresh Playlists & track counts
                         if let Ok(pls) = mgr.get_user_playlists().await {
                             if let Ok(mut st) = state_spotify.write() {

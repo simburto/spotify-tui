@@ -527,11 +527,26 @@ impl SpotifyManager {
         loop {
             let mut added = false;
 
-            if let Some(item) = ar_iter.next() { push_item(item); added = true; }
-            if let Some(item) = t_iter.next() { push_item(item); added = true; }
-            if let Some(item) = al_iter.next() { push_item(item); added = true; }
-            if let Some(item) = pl_iter.next() { push_item(item); added = true; }
-            if let Some(item) = t_iter.next() { push_item(item); added = true; }
+            if let Some(item) = ar_iter.next() {
+                push_item(item);
+                added = true;
+            }
+            if let Some(item) = t_iter.next() {
+                push_item(item);
+                added = true;
+            }
+            if let Some(item) = al_iter.next() {
+                push_item(item);
+                added = true;
+            }
+            if let Some(item) = pl_iter.next() {
+                push_item(item);
+                added = true;
+            }
+            if let Some(item) = t_iter.next() {
+                push_item(item);
+                added = true;
+            }
 
             if !added {
                 break;
@@ -950,7 +965,7 @@ impl SpotifyManager {
     /// Fetches user saved tracks (Liked Songs) with pagination
     pub async fn get_liked_songs(&self) -> Result<Vec<SpotifyTrackItem>> {
         log::info!("Fetching Liked Songs...");
-        self.ensure_token().await?; // <--- Refresh token if expired
+        self.ensure_token().await?;
 
         let mut tracks = Vec::new();
         let mut offset = 0;
@@ -961,7 +976,12 @@ impl SpotifyManager {
             let raw_json: String = match self.client.api_get(&endpoint, &Default::default()).await {
                 Ok(j) => j,
                 Err(e) => {
-                    log::error!("Liked songs API error at offset {}: {:?}", offset, e);
+                    let err_str = format!("{:?}", e);
+                    if err_str.contains("429") {
+                        log::error!("Rate limited (429) on /me/tracks! Aborting liked songs sync to protect quota.");
+                    } else {
+                        log::error!("Liked songs API error at offset {}: {:?}", offset, e);
+                    }
                     break;
                 }
             };
@@ -1383,9 +1403,9 @@ impl SpotifyManager {
                     } else { page.name.clone() };
 
                     let album_id = t.pointer("/albumOfTrack/uri")
-                    .or_else(|| t.pointer("/album/uri"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim_start_matches("spotify:album:").to_string());
+                        .or_else(|| t.pointer("/album/uri"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim_start_matches("spotify:album:").to_string());
 
                     let clean_artist_id = artist_id.trim_start_matches("spotify:artist:").to_string();
 
@@ -1553,11 +1573,38 @@ impl SpotifyManager {
         Ok(())
     }
     pub async fn get_current_user(&self) -> Result<(String, Option<String>, String)> {
-        let raw_json: String = self.client.api_get("me", &Default::default()).await?;
-        let val: Value = serde_json::from_str(&raw_json)?;
-        let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let name = val.get("display_name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-        let avatar_url = val.pointer("/images/0/url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        self.ensure_token().await?;
+        let raw_json: String = self.client.api_get("me", &Default::default()).await
+            .context("Failed to query /v1/me endpoint")?;
+
+        let val: Value = serde_json::from_str(&raw_json)
+            .context("Failed to parse /v1/me JSON")?;
+
+        if let Some(err) = val.get("error") {
+            log::error!("Spotify /v1/me returned error payload: {:?}", err);
+            anyhow::bail!("Spotify API error: {:?}", err);
+        }
+
+        let id = val.get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let display_name = val.get("display_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+
+        let name = match display_name {
+            Some(n) => n.to_string(),
+            None if !id.is_empty() => id.clone(),
+            None => "Spotify User".to_string(),
+        };
+
+        let avatar_url = val.pointer("/images/0/url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        log::info!("Successfully fetched authenticated user: name='{}', id='{}'", name, id);
         Ok((name, avatar_url, id))
     }
     /// Fetches the user's saved albums
@@ -1619,11 +1666,17 @@ impl SpotifyManager {
         Ok(artists)
     }
     pub async fn ensure_token(&self) -> Result<()> {
-        self.client
-            .auto_reauth()
-            .await
-            .context("Failed to refresh Spotify access token")?;
-        Ok(())
+        match self.client.auto_reauth().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log::warn!("Token refresh failed ({:?}). Deleting stale cache file...", e);
+                let cache_path = std::path::PathBuf::from(".spotify_token_cache.json");
+                if cache_path.exists() {
+                    let _ = std::fs::remove_file(cache_path);
+                }
+                Err(anyhow::anyhow!("SESSION_EXPIRED: {:?}", e))
+            }
+        }
     }
     pub async fn check_tracks_saved(&self, track_ids: &[&str]) -> Result<Vec<bool>> {
         self.ensure_token().await?;
@@ -1880,6 +1933,109 @@ impl SpotifyManager {
             "play": play
         });
         self.client.api_put(endpoint, &payload).await?;
+        Ok(())
+    }
+
+    /// Re-runs OAuth loop using existing client credentials when refresh token is revoked
+    pub async fn reauthorize(&mut self) -> Result<()> {
+        log::info!("Re-authorizing session via browser...");
+        let cache_path = std::path::PathBuf::from(".spotify_token_cache.json");
+        if cache_path.exists() {
+            let _ = std::fs::remove_file(&cache_path);
+        }
+
+        // Re-instantiate a clean AuthCodePkceSpotify client to ensure PKCE verifier state is clean
+        let redirect_uri = "http://127.0.0.1:8888/callback".to_string();
+        let oauth = OAuth {
+            redirect_uri,
+            scopes: scopes!(
+                "user-read-private",
+                "user-read-playback-state",
+                "user-modify-playback-state",
+                "playlist-read-private",
+                "playlist-read-collaborative",
+                "playlist-modify-public",
+                "playlist-modify-private",
+                "user-library-read",
+                "user-library-modify",
+                "user-follow-read",
+                "user-follow-modify",
+                "user-read-recently-played",
+                "user-top-read"
+            ),
+            ..Default::default()
+        };
+
+        let client_id = self.client.get_creds().id.clone();
+        let credentials = Credentials::new_pkce(&client_id);
+        let config = Config {
+            token_cached: true,
+            cache_path,
+            ..Default::default()
+        };
+
+        let mut fresh_client = AuthCodePkceSpotify::with_config(credentials, oauth, config);
+        let url = fresh_client.get_authorize_url(None)?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:8888")
+            .await
+            .context("Failed to bind 127.0.0.1:8888 for OAuth callback")?;
+
+        log::info!("Opening browser for Spotify OAuth authorization...");
+        let _ = open::that(&url);
+
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .context("Failed to accept OAuth callback connection")?;
+
+        let mut buffer = [0u8; 2048];
+        let bytes_read = socket
+            .read(&mut buffer)
+            .await
+            .context("Failed to read HTTP request from callback")?;
+
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+
+        let target_path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .context("Malformed HTTP request line from callback")?;
+
+        let full_callback_url = format!("http://127.0.0.1:8888{}", target_path);
+
+        let code = fresh_client
+            .parse_response_code(&full_callback_url)
+            .context("Failed to parse authorization code from callback URL")?;
+
+        fresh_client
+            .request_token(&code)
+            .await
+            .context("Failed to exchange OAuth authorization code for access token")?;
+
+        let response_body = r#"<!DOCTYPE html>
+            <html>
+            <head><title>Spotify-tui Authorization Successful</title></head>
+            <body style="background-color: #191724; color: #ebbcba; font-family: monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 80vh;">
+                <h2>Authentication Successful!</h2>
+                <p style="color: #908caa;">Spotify-tui has received your Spotify credentials. You can safely close this tab.</p>
+            </body>
+            </html>"#;
+
+        let http_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+
+        use tokio::io::AsyncWriteExt;
+        let _ = socket.write_all(http_response.as_bytes()).await;
+        let _ = socket.flush().await;
+
+        let _ = fresh_client.write_token_cache().await;
+        self.client = fresh_client;
+        log::info!("New token captured and saved to disk.");
         Ok(())
     }
 }
