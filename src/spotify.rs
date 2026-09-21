@@ -169,8 +169,15 @@ impl SpotifyManager {
                 log::info!("Starting temporary local server on 127.0.0.1:8888 for OAuth callback...");
 
                 // Bind a single-use TCP listener on the exact redirect URI port
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:8888")
-                    .await
+                let addr: std::net::SocketAddr = "127.0.0.1:8888".parse().unwrap();
+                let socket = tokio::net::TcpSocket::new_v4()?;
+                #[cfg(windows)]
+                {
+                    // Allows immediate binding over TIME_WAIT sockets on Windows
+                    socket.set_reuseaddr(true)?;
+                }
+                let listener = socket.bind(addr)
+                    .and_then(|_| socket.listen(128))
                     .context("Failed to bind 127.0.0.1:8888 for OAuth callback")?;
 
                 log::info!("Opening browser for Spotify OAuth authorization...");
@@ -1977,8 +1984,15 @@ impl SpotifyManager {
         let mut fresh_client = AuthCodePkceSpotify::with_config(credentials, oauth, config);
         let url = fresh_client.get_authorize_url(None)?;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8888")
-            .await
+        let addr: std::net::SocketAddr = "127.0.0.1:8888".parse().unwrap();
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        #[cfg(windows)]
+        {
+            // Allows immediate binding over TIME_WAIT sockets on Windows
+            socket.set_reuseaddr(true)?;
+        }
+        let listener = socket.bind(addr)
+            .and_then(|_| socket.listen(128))
             .context("Failed to bind 127.0.0.1:8888 for OAuth callback")?;
 
         log::info!("Opening browser for Spotify OAuth authorization...");
