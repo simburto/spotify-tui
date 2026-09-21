@@ -3,9 +3,9 @@
 A standalone desktop client built with Rust that interfaces with a minimal headless Linux guest via QEMU. It captures lossless audio streams from Spotify Soloist running inside the micro-VM.
 
 ---
-![img_2.png](img_2.png)
-![img.png](img.png)
-![img_1.png](img_1.png)
+![img_2.png](assets/img_2.png)
+![img.png](assets/img.png)
+![img_1.png](assets/img_1.png)
 ## Architecture Overview
 
 ```text
