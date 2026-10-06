@@ -2,6 +2,7 @@
 
 mod qemu;
 mod spotify;
+mod queue_jump;
 
 use qemu::{QemuBackend, QemuConfig};
 use anyhow::{Context, Result};
@@ -101,12 +102,7 @@ enum SoloistCommand {
     Next,
     Previous,
     Seek(u64),
-    PlayUri(String),
-    PlayContext {
-        uri: String,
-        context_uri: Option<String>,
-        offset_index: Option<usize>,
-    },
+    JumpToQueueTrack(usize),
     ToggleShuffle,
     CycleRepeat,
     Activate,
@@ -186,7 +182,7 @@ pub struct TrackContextMenu {
     pub filter_query: String,
     pub show_playlist_submenu: bool,
     pub is_saved: bool,
-    pub track_index: usize,
+    pub track_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +205,7 @@ struct AppState {
     artist_page: Option<ArtistPageData>,
     user_playlists: Vec<SpotifyPlaylistItem>,
     selected_track_uri: Option<String>,
+    current_track_uri: Option<String>,
     active_nav: String,
     view_title: String,
 
@@ -281,6 +278,7 @@ impl Default for AppState {
             artist_page: None,
             user_playlists: Vec::new(),
             selected_track_uri: None,
+            current_track_uri: None,
             active_nav: "Home".into(),
             active_context_uri: None,
             view_title: "Spotatui Home".into(),
@@ -770,6 +768,57 @@ fn draw_crisp_speaker_icon(painter: &egui::Painter, center: Pos2, color: Color32
 }
 
 impl SoloistApp {
+    fn open_track_context_menu(
+        ui: &egui::Ui,
+        rect: Rect,
+        st: &mut AppState,
+        track: &SpotifyTrackItem,
+        track_index: Option<usize>,
+        req_tx: &mpsc::Sender<SpotifyRequest>,
+    ) {
+        // Test the whole track region, including child labels and links, while
+        // respecting clipping and foreground layers such as the open menu.
+        if !ui.rect_contains_pointer(rect) || !ui.input(|i| i.pointer.secondary_clicked()) {
+            return;
+        }
+        let is_saved = st.liked_track_uris.contains(&track.uri);
+        if !is_saved {
+            let _ = req_tx.blocking_send(SpotifyRequest::CheckLibraryTrack(track.uri.clone()));
+        }
+        st.context_menu = Some(TrackContextMenu {
+            track: track.clone(),
+            click_pos: ui.input(|i| i.pointer.interact_pos()).unwrap_or(rect.left_bottom()),
+            filter_query: String::new(),
+            show_playlist_submenu: false,
+            is_saved,
+            track_index,
+        });
+    }
+
+    fn open_current_track_context_menu(
+        ui: &egui::Ui,
+        rect: Rect,
+        st: &mut AppState,
+        req_tx: &mpsc::Sender<SpotifyRequest>,
+    ) {
+        if !ui.rect_contains_pointer(rect) || !ui.input(|i| i.pointer.secondary_clicked()) {
+            return;
+        }
+        if let Some(uri) = st.current_track_uri.clone() {
+            let track = SpotifyTrackItem {
+                title: st.title.clone(),
+                artist: st.artist.clone(),
+                album: st.album.clone(),
+                duration_ms: st.duration_ms,
+                uri,
+                artists: st.current_artists.clone(),
+                album_id: st.current_album_id.clone(),
+                uid: None,
+            };
+            Self::open_track_context_menu(ui, rect, st, &track, None, req_tx);
+        }
+    }
+
     fn new(
         state: Arc<std::sync::RwLock<AppState>>,
         cmd_tx: mpsc::Sender<SoloistCommand>,
@@ -1107,6 +1156,13 @@ impl eframe::App for SoloistApp {
         // Periodically refresh the sidebar library every 60 seconds
         let should_refresh_library = {
             let st = self.state.read().unwrap();
+            // Background workers update shared state without generating window
+            // input events. Keep polling it even when the pointer is elsewhere.
+            ctx.request_repaint_after(Duration::from_millis(if st.is_playing {
+                33
+            } else {
+                250
+            }));
             st.last_library_sync.elapsed() >= Duration::from_secs(60)
         };
 
@@ -1727,12 +1783,14 @@ impl eframe::App for SoloistApp {
                                         let line = format!("{:02}. {} [{}] ({:02}:{:02})", i + 1, track.title, track.album, dur_m, dur_s);
 
                                         // In Artist Top Tracks section:
-                                        if ui.selectable_label(
+                                        let track_resp = ui.selectable_label(
                                             is_sel,
                                             RichText::new(line)
                                                 .font(FontId::monospace(11.5))
                                                 .color(if is_sel { Color32::BLACK } else { COLOR_TEXT_BRIGHT }),
-                                        ).clicked() {
+                                        );
+                                        Self::open_track_context_menu(ui, track_resp.rect, &mut st, track, None, &self.spotify_req_tx);
+                                        if track_resp.clicked() {
                                             st.selected_track_uri = Some(track.uri.clone());
 
                                             // Slice upcoming tracks from the artist's popular list
@@ -1889,6 +1947,20 @@ impl eframe::App for SoloistApp {
                                     let line = format!("{}  ({})", item.title, item.subtitle);
 
                                     let (row_rect, row_resp) = ui.allocate_exact_size(Vec2::new(row_w, row_h), egui::Sense::click());
+
+                                    if matches!(item.kind, SearchResultKind::Track)
+                                        && ui.rect_contains_pointer(row_rect)
+                                        && ui.input(|i| i.pointer.secondary_clicked())
+                                    {
+                                        let track = SpotifyTrackItem {
+                                            title: item.title.clone(),
+                                            artist: item.subtitle.clone(),
+                                            uri: item.uri.clone(),
+                                            duration_ms: item.duration_ms,
+                                            ..Default::default()
+                                        };
+                                        Self::open_track_context_menu(ui, row_rect, &mut st, &track, None, &self.spotify_req_tx);
+                                    }
 
                                     // Background selection/hover highlight
                                     if is_sel {
@@ -2148,8 +2220,6 @@ impl eframe::App for SoloistApp {
                                                 ui.add_space(start_idx as f32 * row_h);
                                             }
 
-                                            let mut context_menu_action: Option<TrackContextMenu> = None;
-
                                             for i in start_idx..end_idx {
                                                 let track = &st.displayed_tracks[i];
                                                 let is_sel = st.selected_track_uri.as_ref() == Some(&track.uri);
@@ -2163,31 +2233,11 @@ impl eframe::App for SoloistApp {
                                                     play_action = Some((i, track.clone()));
                                                 }
 
-                                                // Capture right-click to spawn context menu
-                                                if row_resp.secondary_clicked() {
-                                                    let mouse_pos = ui.input(|i| i.pointer.interact_pos())
-                                                        .or_else(|| ui.input(|i| i.pointer.hover_pos()))
-                                                        .unwrap_or(row_rect.left_bottom());
-
-                                                    // Fast check against the local liked cache
-                                                    let is_saved = st.liked_track_uris.contains(&track.uri)
-                                                        || st.active_nav == "Liked Songs"
-                                                        || (st.selected_track_uri.as_ref() == Some(&track.uri) && st.is_track_saved);
-
-                                                    // Trigger API verification if not currently confirmed
-                                                    if !is_saved {
-                                                        let _ = self.spotify_req_tx.blocking_send(SpotifyRequest::CheckLibraryTrack(track.uri.clone()));
-                                                    }
-
-                                                    context_menu_action = Some(TrackContextMenu {
-                                                        track: track.clone(),
-                                                        click_pos: mouse_pos,
-                                                        filter_query: String::new(),
-                                                        show_playlist_submenu: false,
-                                                        is_saved,
-                                                        track_index: i,
-                                                    });
+                                                if ui.rect_contains_pointer(row_rect) && ui.input(|i| i.pointer.secondary_clicked()) {
+                                                    let track = track.clone();
+                                                    Self::open_track_context_menu(ui, row_rect, &mut st, &track, Some(i), &self.spotify_req_tx);
                                                 }
+                                                let track = &st.displayed_tracks[i];
                                                 
                                                 if is_sel {
                                                     ui.painter().rect_filled(row_rect, Rounding::ZERO, Color32::from_white_alpha(18));
@@ -2281,9 +2331,6 @@ impl eframe::App for SoloistApp {
                                                 );
                                             }
 
-                                            if let Some(menu) = context_menu_action {
-                                                st.context_menu = Some(menu);
-                                            }
                                             // Bottom spacer for virtual items below viewport
                                             let remaining = total_tracks.saturating_sub(end_idx);
                                             if remaining > 0 {
@@ -2501,7 +2548,7 @@ impl eframe::App for SoloistApp {
                                         let cur_s = (st.duration_ms % 60000) / 1000;
                                         let dur_str = format!("{:02}:{:02}", cur_m, cur_s);
 
-                                        ui.horizontal(|ui| {
+                                        let current_row = ui.horizontal(|ui| {
                                             ui.label(
                                                 RichText::new("▶ ")
                                                     .font(FontId::monospace(10.0))
@@ -2523,6 +2570,7 @@ impl eframe::App for SoloistApp {
                                                 );
                                             });
                                         });
+                                        Self::open_current_track_context_menu(ui, current_row.response.rect, &mut st, &self.spotify_req_tx);
                                     }
 
                                     ui.add_space(10.0);
@@ -2530,14 +2578,15 @@ impl eframe::App for SoloistApp {
                                     // Define render_queue_row closure before iterating items
                                     let render_queue_row = |ui: &mut egui::Ui,
                                                             num_label: String,
+                                                            queue_index: usize,
                                                             track: &SpotifyTrackItem,
                                                             cmd_tx: &mpsc::Sender<SoloistCommand>,
-                                                            selected_track_uri: &mut Option<String>| {
+                                                            st: &mut AppState| {
                                         let dur_m = track.duration_ms / 60000;
                                         let dur_s = (track.duration_ms % 60000) / 1000;
                                         let dur_str = format!("{:02}:{:02}", dur_m, dur_s);
 
-                                        ui.horizontal(|ui| {
+                                        let row = ui.horizontal(|ui| {
                                             ui.label(
                                                 RichText::new(num_label)
                                                     .font(FontId::monospace(10.0))
@@ -2554,8 +2603,8 @@ impl eframe::App for SoloistApp {
                                                 );
 
                                                 if label_resp.clicked() {
-                                                    *selected_track_uri = Some(track.uri.clone());
-                                                    let _ = cmd_tx.blocking_send(SoloistCommand::PlayUri(track.uri.clone()));
+                                                    st.selected_track_uri = Some(track.uri.clone());
+                                                    let _ = cmd_tx.blocking_send(SoloistCommand::JumpToQueueTrack(queue_index));
                                                 }
 
                                                 let meta = format!("{} ({})", track.artist, dur_str);
@@ -2566,6 +2615,7 @@ impl eframe::App for SoloistApp {
                                                 );
                                             });
                                         });
+                                        Self::open_track_context_menu(ui, row.response.rect, st, track, None, &self.spotify_req_tx);
                                         ui.add_space(4.0);
                                     };
 
@@ -2588,9 +2638,10 @@ impl eframe::App for SoloistApp {
                                             render_queue_row(
                                                 ui,
                                                 num_str,
+                                                track_num - 1,
                                                 track,
                                                 &self.cmd_tx,
-                                                &mut st.selected_track_uri,
+                                                &mut st,
                                             );
                                             track_num += 1;
                                         }
@@ -2619,9 +2670,10 @@ impl eframe::App for SoloistApp {
                                             render_queue_row(
                                                 ui,
                                                 num_str,
+                                                track_num - 1,
                                                 track,
                                                 &self.cmd_tx,
-                                                &mut st.selected_track_uri,
+                                                &mut st,
                                             );
                                             track_num += 1;
                                         }
@@ -2629,6 +2681,7 @@ impl eframe::App for SoloistApp {
                                 } else {
                                 // --- NOW PLAYING & ARTIST VIEW ---
                                 let art_size = (right_w - 20.0).max(120.0);
+                                let track_region_start = ui.cursor().min;
 
                                 // 1. Album Cover Image
                                 if let Some(ref url) = st.cover_url {
@@ -2721,6 +2774,9 @@ impl eframe::App for SoloistApp {
                                         dispatch_nav(target, &mut st, &self.spotify_req_tx);
                                     }
                                 }
+
+                                let track_rect = Rect::from_min_max(track_region_start, Pos2::new(track_region_start.x + art_size, ui.cursor().min.y));
+                                Self::open_current_track_context_menu(ui, track_rect, &mut st, &self.spotify_req_tx);
 
                                 ui.add_space(10.0);
                                 ui.separator();
@@ -2916,6 +2972,8 @@ impl eframe::App for SoloistApp {
                             }
                         });
                     });
+
+                    Self::open_current_track_context_menu(ui, left_rect, &mut st, &self.spotify_req_tx);
 
                     // 2. CENTER: Transport Controls
                     let gap = 8.0;
@@ -3371,7 +3429,10 @@ impl eframe::App for SoloistApp {
                                         let in_playlist = st.active_context_uri.as_ref().map_or(false, |u| u.starts_with("spotify:playlist:"));
 
                                         // Render Remove from playlist only if inside an owned playlist
-                                        if in_playlist && is_playlist_owner {
+                                        let playlist_track_index = menu.track_index.filter(|&i| {
+                                            st.displayed_tracks.get(i).map_or(false, |t| t.uri == track.uri)
+                                        });
+                                        if in_playlist && is_playlist_owner && playlist_track_index.is_some() {
                                             let remove_resp = render_item(ui, "⊖  Remove from playlist", false, false);
                                             // Close flyout when hovering other items
                                             if remove_resp.hovered() {
@@ -3379,7 +3440,7 @@ impl eframe::App for SoloistApp {
                                             }
                                             if remove_resp.clicked() {
                                                 if let Some(ref uri) = active_context_uri {
-                                                    let pos = menu.track_index;
+                                                    let pos = playlist_track_index.unwrap();
 
                                                     if pos < st.displayed_tracks.len() {
                                                         st.displayed_tracks.remove(pos);
@@ -3754,24 +3815,31 @@ fn main() -> Result<()> {
                     });
                     log::info!("--> Querying initial queue state (expanded)...");
                     let _ = write.send(Message::Text(get_queue_payload.to_string())).await;
+                    let mut queue_jump = queue_jump::QueueJump::default();
+                    let mut jump_deadline = tokio::time::Instant::now();
                     loop {
                         tokio::select! {
+                            _ = tokio::time::sleep_until(jump_deadline), if queue_jump.is_active() => {
+                                log::warn!("Queue jump timed out waiting for a track change");
+                                queue_jump.cancel();
+                            }
                             Some(cmd) = cmd_rx.recv() => {
+                                // Ignore repeated row clicks during a jump: their indices
+                                // refer to a queue that is already being consumed.
+                                if queue_jump.is_active() && matches!(cmd, SoloistCommand::JumpToQueueTrack(_)) {
+                                    continue;
+                                }
+                                // Transport controls (especially pause) can interrupt a jump.
+                                queue_jump.cancel();
                                 let payloads: Vec<serde_json::Value> = match cmd {
                                     SoloistCommand::Play => vec![serde_json::json!({
                                         "type": "command",
                                         "command": "play"
                                     })],
-                                    SoloistCommand::PlayUri(uri) => vec![serde_json::json!({
-                                        "type": "command",
-                                        "command": "play",
-                                        "uri": uri
-                                    })],
-                                    SoloistCommand::PlayContext { uri, .. } => vec![serde_json::json!({
-                                        "type": "command",
-                                        "command": "play",
-                                        "uri": uri
-                                    })],
+                                    SoloistCommand::JumpToQueueTrack(index) => {
+                                        jump_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                                        vec![queue_jump.start(index)]
+                                    }
                                     SoloistCommand::Pause => vec![serde_json::json!({
                                         "type": "command",
                                         "command": "pause"
@@ -3887,6 +3955,7 @@ fn main() -> Result<()> {
                                     log::info!("--> WebSocket Outbound: {}", msg);
                                     if let Err(e) = write.send(Message::Text(msg)).await {
                                         log::error!("Failed to send command to Soloist: {:?}", e);
+                                        queue_jump.cancel();
                                         break;
                                     }
                                 }
@@ -3900,6 +3969,17 @@ fn main() -> Result<()> {
                                             if let Ok(mut st) = state_ws.write() {
                                                 handle_soloist_event(&val, &mut st);
                                                 let _ = smtc_updater.send(st.clone());
+                                            }
+                                            let payloads = queue_jump.on_event(&val);
+                                            if queue_jump.is_active() && !payloads.is_empty() {
+                                                jump_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                                            }
+                                            for payload in payloads {
+                                                if let Err(e) = write.send(Message::Text(payload.to_string())).await {
+                                                    log::error!("Failed to advance queue: {:?}", e);
+                                                    queue_jump.cancel();
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -4508,6 +4588,7 @@ fn handle_soloist_event(event: &Value, state: &mut AppState) {
             if let Some(item) = event.get("item") {
                 if let Some(uri) = item.get("uri").and_then(|v| v.as_str()) {
                     state.selected_track_uri = Some(uri.to_string());
+                    state.current_track_uri = Some(uri.to_string());
                 }
                 // 1. Track Title
                 if let Some(name) = item.pointer("/decorations/identity/name")
@@ -4738,8 +4819,9 @@ fn handle_soloist_event(event: &Value, state: &mut AppState) {
                 };
 
                 // In Spotify protocol:
-                // provider == "queue" or provider == "user" or has queued_by indicates a manually queued track.
+                // Soloist uses source; older payloads may use provider or queued_by.
                 let provider = entry.get("provider")
+                    .or_else(|| entry.get("source"))
                     .or_else(|| item.get("provider"))
                     .or_else(|| entry.pointer("/metadata/provider"))
                     .and_then(|v| v.as_str())
@@ -4761,7 +4843,7 @@ fn handle_soloist_event(event: &Value, state: &mut AppState) {
                         uri,
                         artists: artist_pairs,
                         album_id,
-                        uid: None,
+                        uid: entry.get("uid").and_then(|v| v.as_str()).map(str::to_owned),
                     },
                     is_queued,
                 ))
